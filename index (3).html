@@ -147,6 +147,72 @@
         .input-copy-wrapper #user-input {
             padding-right: 2.4rem;
         }
+        .response-actions {
+            margin-top: 10px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            color: #64748b;
+            font-size: 12px;
+            opacity: 1;
+        }
+        .response-actions button {
+            background: transparent;
+            border: none;
+            cursor: pointer;
+            color: #94a3b8;
+            font-size: 15px;
+            line-height: 1;
+            padding: 4px 6px;
+            border-radius: 8px;
+            transition: color 0.15s ease, transform 0.15s ease, background-color 0.15s ease;
+        }
+        .response-actions button:hover {
+            background: #f1f5f9;
+            color: #334155;
+        }
+        .response-actions button.active-like {
+            color: #16a34a;
+        }
+        .response-actions button.active-dislike {
+            color: #dc2626;
+        }
+        .response-actions button.copied {
+            color: #16a34a;
+        }
+        .response-actions button.active-like,
+        .response-actions button.active-dislike {
+            transform: scale(1.08);
+        }
+        .logger-toolbar {
+            margin-top: 8px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            color: #6b7280;
+            font-size: 12px;
+        }
+        .toolbar-btn {
+            background: #ffffff;
+            border: 1px solid #d1d5db;
+            border-radius: 9999px;
+            padding: 3px 10px;
+            color: #4b5563;
+            cursor: pointer;
+            transition: background-color 0.15s ease;
+        }
+        .toolbar-btn:hover {
+            background: #f9fafb;
+        }
+        .guardrail-banner {
+            border: 1px solid #f59e0b;
+            background: linear-gradient(180deg, #fffbeb 0%, #fff7ed 100%);
+            color: #92400e;
+            border-radius: 12px;
+            padding: 8px 10px;
+            font-size: 12px;
+            margin-bottom: 8px;
+        }
         .generated-file {
             margin-top: 12px;
             border-radius: 16px;
@@ -607,6 +673,14 @@
         <div id="chat-messages" class="flex-1 p-6 overflow-y-auto bg-gray-50 space-y-7"></div>
         <!-- Input Area -->
         <div id="input-area" class="px-3 py-3 border-t bg-white">
+            <div class="guardrail-banner">
+                Student Safety Guardrail is ON. Nexa blocks harmful, explicit, hateful, violent, self-harm, cheating, and privacy-invasive requests.
+            </div>
+            <div class="mb-2">
+                <input id="user-name" type="text"
+                       class="w-full border border-gray-300 rounded-2xl px-4 py-2.5 focus:outline-none focus:border-gray-400 text-sm"
+                       placeholder="Enter your name (required for MySQL logging)"/>
+            </div>
             <div class="flex items-center gap-2">
                 <button id="attach-btn" class="flex-shrink-0 w-10 h-10 flex items-center justify-center text-gray-400 hover:text-gray-600 hover:bg-gray-100 rounded-xl transition-all">
                     <i class="fa-solid fa-paperclip text-lg"></i>
@@ -624,6 +698,10 @@
                     <i class="fa-solid fa-paper-plane text-sm"></i>
                 </button>
             </div>
+            <div class="logger-toolbar">
+                <span id="stack-size">Logs in stack: 0</span>
+                <button id="undo-log-btn" class="toolbar-btn" type="button">Undo Last Log (Pop)</button>
+            </div>
         </div>
     </div>
 
@@ -632,19 +710,171 @@
 // ==================== CONFIG ====================
 const API_URL = "/chat";
 const UPLOAD_URL = "/upload";
+const LOGGER_BASE_URL =
+    window.NEXA_LOGGER_BASE_URL ||
+    localStorage.getItem('nexa_logger_base_url') ||
+    `${window.location.protocol}//${window.location.hostname}:8001`;
+const LOG_API_URL = `${LOGGER_BASE_URL}/api/chat-log`;
+const RATING_API_URL = `${LOGGER_BASE_URL}/api/chat-rating`;
+const POP_API_URL = `${LOGGER_BASE_URL}/api/chat-log/pop`;
 
 const chatButton = document.getElementById('chat-button');
 const chatWindow = document.getElementById('chat-window');
 const closeChat = document.getElementById('close-chat');
 const messagesContainer = document.getElementById('chat-messages');
 const userInput = document.getElementById('user-input');
+const userNameInput = document.getElementById('user-name');
 const sendButton = document.getElementById('send-button');
 const attachBtn = document.getElementById('attach-btn');
+const undoLogBtn = document.getElementById('undo-log-btn');
+const stackSizeLabel = document.getElementById('stack-size');
 
-let isOpen = false;
 let sessionId = localStorage.getItem('nexa_session_id') || null;
 let userMessageCount = 0;
 const FEEDBACK_TRIGGER_COUNT = 2; // show feedback after every 2 prompts
+
+const chatLogStack = [];
+const pendingLogRetryStack = [];
+
+userNameInput.value = localStorage.getItem('nexa_user_name') || '';
+userNameInput.addEventListener('change', () => {
+    localStorage.setItem('nexa_user_name', userNameInput.value.trim());
+});
+
+function getInternationalTimestamp() {
+    return new Date().toISOString();
+}
+
+function updateStackSizeLabel() {
+    stackSizeLabel.textContent = `Logs in stack: ${chatLogStack.length}`;
+}
+
+const guardrailRules = [
+    {
+        name: 'sexual content',
+        pattern: /\b(sex|nude|naked|porn|explicit|sexual|blowjob|handjob|intercourse)\b/i,
+        reply: 'I cannot help with sexual or explicit content. I can help with school-safe learning topics instead.'
+    },
+    {
+        name: 'violence or weapons',
+        pattern: /\b(kill|murder|stab|shoot|weapon|bomb|explosive|poison|attack)\b/i,
+        reply: 'I cannot help with violent or weapon-related requests. I can help with safety and education topics.'
+    },
+    {
+        name: 'self-harm',
+        pattern: /\b(suicide|self-harm|cut myself|hurt myself|die by suicide)\b/i,
+        reply: 'I cannot help with self-harm requests. Please reach out to a trusted adult, counselor, or emergency support right away.'
+    },
+    {
+        name: 'hate or harassment',
+        pattern: /\b(racist|sexist|homophobic|slur|hate speech|dehumanize|harass)\b/i,
+        reply: 'I cannot help with hateful or harassing content. I can help rewrite your request in respectful language.'
+    },
+    {
+        name: 'cheating or misconduct',
+        pattern: /\b(cheat|plagiarize|test answer key|exam leak|bypass school filter|hack class account)\b/i,
+        reply: 'I cannot help with cheating or misconduct. I can help you study and practice honestly.'
+    },
+    {
+        name: 'privacy invasion',
+        pattern: /\b(password|otp|credit card|bank account|personal data|doxx|address|phone number)\b/i,
+        reply: 'I cannot help with private or sensitive information misuse. I can help with digital safety guidance instead.'
+    },
+    {
+        name: 'drugs or substances',
+        pattern: /\b(drug|cocaine|meth|heroin|weed|marijuana|smuggle|overdose)\b/i,
+        reply: 'I cannot help with drug misuse requests. I can help with health and prevention information.'
+    },
+    {
+        name: 'severe profanity',
+        pattern: /\b(fuck|shit|bitch|bastard)\b/i,
+        reply: 'Let us keep this school-appropriate. I can still help with a clean version of your question.'
+    }
+];
+
+function classifyPrompt(text) {
+    const cleaned = (text || '').trim();
+    if (!cleaned) {
+        return { allowed: true, category: null, reply: null };
+    }
+
+    for (const rule of guardrailRules) {
+        if (rule.pattern.test(cleaned)) {
+            return { allowed: false, category: rule.name, reply: rule.reply };
+        }
+    }
+
+    return { allowed: true, category: null, reply: null };
+}
+
+function containsUnsafeModelOutput(text) {
+    return guardrailRules.some(rule => rule.pattern.test(text || ''));
+}
+
+function pushChatLog(logEntry) {
+    chatLogStack.push(logEntry);
+    updateStackSizeLabel();
+}
+
+function popChatLog() {
+    const removed = chatLogStack.pop();
+    updateStackSizeLabel();
+    return removed;
+}
+
+async function saveChatLogToDatabase(logEntry) {
+    try {
+        const res = await fetch(LOG_API_URL, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(logEntry)
+        });
+
+        if (!res.ok) {
+            throw new Error(`Logger API returned ${res.status}`);
+        }
+
+        return true;
+    } catch (err) {
+        pendingLogRetryStack.push(logEntry);
+        console.error('Log save failed; moved to retry stack.', err);
+        return false;
+    }
+}
+
+async function saveRatingToDatabase(payload) {
+    try {
+        const res = await fetch(RATING_API_URL, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        });
+
+        if (!res.ok) {
+            throw new Error(`Rating API returned ${res.status}`);
+        }
+    } catch (err) {
+        console.error('Rating save failed', err);
+    }
+}
+
+async function retryPendingLogs() {
+    while (pendingLogRetryStack.length > 0) {
+        const nextLog = pendingLogRetryStack.pop();
+        const ok = await saveChatLogToDatabase(nextLog);
+        if (!ok) break;
+    }
+}
+
+async function updateLogResponse(logId, responseText) {
+    const logItem = chatLogStack.find(item => item.log_id === logId);
+    if (!logItem) return;
+
+    logItem.nexa_response = responseText;
+    logItem.timestamp = getInternationalTimestamp();
+    await saveChatLogToDatabase(logItem);
+    await retryPendingLogs();
+}
 
 // ==================== MARKDOWN ====================
 function renderMarkdown(text) {
@@ -652,7 +882,7 @@ function renderMarkdown(text) {
 }
 
 // ==================== ADD MESSAGE ====================
-function addMessage(text, isUser, fileUrl = null, isPdf = false, pairId = null) {
+function addMessage(text, isUser, fileUrl = null, isPdf = false, pairId = null, logMeta = null) {
     const div = document.createElement('div');
     div.className = `flex ${isUser ? 'justify-end' : 'justify-start'} group`;
     if (isUser) {
@@ -697,17 +927,87 @@ function addMessage(text, isUser, fileUrl = null, isPdf = false, pairId = null) 
                     <button class="msg-action-btn copy-pair-btn" onclick="copyPair('${pairId}')" title="Copy prompt + response">
                         <i class="fa-solid fa-clone"></i>
                     </button>` : '';
+        const responseControls = logMeta && logMeta.logId ? `
+                <div class="response-actions" data-log-id="${logMeta.logId}">
+                    <button type="button" class="copy-response-btn" title="Copy response">
+                        <i class="fa-regular fa-copy"></i>
+                    </button>
+                    <button type="button" class="like-response-btn" title="Good response">
+                        <i class="fa-regular fa-thumbs-up"></i>
+                    </button>
+                    <button type="button" class="dislike-response-btn" title="Bad response">
+                        <i class="fa-regular fa-thumbs-down"></i>
+                    </button>${copyPairBtn}
+                </div>` : '';
         html += `
                 <div class="message-actions">
                     <button class="msg-action-btn copy-output-btn" onclick="copyOutput(this)" title="Copy response">
                         <i class="fa-regular fa-copy"></i>
-                    </button>${copyPairBtn}
-                </div>
+                    </button>
+                </div>${responseControls}
             </div>`;
         div.innerHTML = html;
     }
     messagesContainer.appendChild(div);
     div.querySelectorAll('.user-message, .bot-message').forEach(attachMsgHover);
+
+    if (!isUser && logMeta && logMeta.logId) {
+        const controls = div.querySelector('.response-actions');
+        const copyBtn = controls ? controls.querySelector('.copy-response-btn') : null;
+        const likeBtn = controls ? controls.querySelector('.like-response-btn') : null;
+        const dislikeBtn = controls ? controls.querySelector('.dislike-response-btn') : null;
+
+        if (copyBtn) {
+            copyBtn.addEventListener('click', async () => {
+                const markdown = div.querySelector('.markdown-body');
+                const responseText = markdown ? markdown.innerText.trim() : text;
+                try {
+                    await navigator.clipboard.writeText(responseText);
+                    copyBtn.classList.add('copied');
+                    copyBtn.innerHTML = '<i class="fa-solid fa-check"></i>';
+                    setTimeout(() => {
+                        copyBtn.classList.remove('copied');
+                        copyBtn.innerHTML = '<i class="fa-regular fa-copy"></i>';
+                    }, 1200);
+                } catch (err) {
+                    console.error('Copy failed', err);
+                }
+            });
+        }
+
+        const setFeedback = async (type) => {
+            const stars = type === 'like' ? 5 : 1;
+
+            if (likeBtn && dislikeBtn) {
+                likeBtn.classList.toggle('active-like', type === 'like');
+                dislikeBtn.classList.toggle('active-dislike', type === 'dislike');
+                likeBtn.innerHTML = type === 'like' ? '<i class="fa-solid fa-thumbs-up"></i>' : '<i class="fa-regular fa-thumbs-up"></i>';
+                dislikeBtn.innerHTML = type === 'dislike' ? '<i class="fa-solid fa-thumbs-down"></i>' : '<i class="fa-regular fa-thumbs-down"></i>';
+            }
+
+            const logItem = chatLogStack.find(item => item.log_id === logMeta.logId);
+            if (logItem) {
+                logItem.stars = stars;
+                logItem.timestamp = getInternationalTimestamp();
+            }
+
+            await saveRatingToDatabase({
+                log_id: logMeta.logId,
+                user_name: logMeta.userName,
+                stars,
+                timestamp: getInternationalTimestamp()
+            });
+        };
+
+        if (likeBtn) {
+            likeBtn.addEventListener('click', () => setFeedback('like'));
+        }
+
+        if (dislikeBtn) {
+            dislikeBtn.addEventListener('click', () => setFeedback('dislike'));
+        }
+    }
+
     messagesContainer.scrollTop = messagesContainer.scrollHeight;
 }
 
@@ -855,8 +1155,55 @@ async function sendMessage() {
     const text = userInput.value.trim();
     if (!text) return;
 
+    const userName = userNameInput.value.trim();
+    if (!userName) {
+        addMessage('Please enter your name first. Logs are stored user by user in MySQL.', false);
+        userNameInput.focus();
+        return;
+    }
+
+    localStorage.setItem('nexa_user_name', userName);
+
+    const assessment = classifyPrompt(text);
+    if (!assessment.allowed) {
+        const pairId = 'p' + Date.now();
+        const logId = `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+        const blockedReply = `${assessment.reply} This request was blocked by Nexa student safety guardrails.`;
+
+        addMessage(text, true, null, false, pairId);
+        addMessage(blockedReply, false, null, false, pairId, { logId, userName });
+
+        const blockedLog = {
+            log_id: logId,
+            user_name: userName,
+            user_prompt: text,
+            nexa_response: blockedReply,
+            timestamp: getInternationalTimestamp(),
+            stars: 0
+        };
+        pushChatLog(blockedLog);
+        await saveChatLogToDatabase(blockedLog);
+        await retryPendingLogs();
+
+        userInput.value = '';
+        return;
+    }
+
     const pairId = 'p' + Date.now();
+    const logId = `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+    const timestamp = getInternationalTimestamp();
+
     addMessage(text, true, null, false, pairId);
+
+    pushChatLog({
+        log_id: logId,
+        user_name: userName,
+        user_prompt: text,
+        nexa_response: '',
+        timestamp,
+        stars: 0
+    });
+
     userInput.value = "";
 
     // Track user message count & trigger feedback window ONCE after 2 prompts
@@ -904,10 +1251,19 @@ async function sendMessage() {
         sessionId = data.session_id;
         localStorage.setItem("nexa_session_id", sessionId);
 
+        const modelText = data.response || '';
+        if (containsUnsafeModelOutput(modelText)) {
+            const blockedModelReply = 'I cannot provide that content. This response was blocked by Nexa student safety guardrails.';
+            addMessage(blockedModelReply, false, null, false, pairId, { logId, userName });
+            await updateLogResponse(logId, blockedModelReply);
+            return;
+        }
+
         // ================= IMAGE HANDLING (FIXED) =================
 	if (data.image_url && data.image_id) {
 
-    addMessage(data.response, false, null, false, pairId);
+    addMessage(data.response, false, null, false, pairId, { logId, userName });
+    await updateLogResponse(logId, data.response || '');
 
     const imageUrl = data.image_url;
     const imageId = data.image_id;
@@ -954,7 +1310,8 @@ async function sendMessage() {
 
         } else {
             // normal text response
-            addMessage(data.response, false, data.pdf_url, !!data.pdf_url, pairId);
+            addMessage(data.response, false, data.pdf_url, !!data.pdf_url, pairId, { logId, userName });
+            await updateLogResponse(logId, data.response || '');
         }
 
     } catch (err) {
@@ -966,6 +1323,8 @@ async function sendMessage() {
             "⚠️ Sorry, I'm having trouble connecting. Please try again.",
             false
         );
+
+        await updateLogResponse(logId, 'Connection error: response not received.');
     }
 }
 
@@ -974,6 +1333,32 @@ sendButton.addEventListener('click', sendMessage);
 userInput.addEventListener('keypress', e => { if (e.key === 'Enter') sendMessage(); });
 chatButton.addEventListener('click', () => chatWindow.classList.toggle('hidden'));
 closeChat.addEventListener('click', () => chatWindow.classList.add('hidden'));
+undoLogBtn.addEventListener('click', async () => {
+    const removed = popChatLog();
+    if (!removed) {
+        addMessage('No logs available to pop from stack.', false);
+        return;
+    }
+
+    try {
+        const res = await fetch(POP_API_URL, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ log_id: removed.log_id })
+        });
+
+        if (!res.ok) {
+            throw new Error(`Pop API returned ${res.status}`);
+        }
+
+        addMessage(`Last log removed for user ${removed.user_name}.`, false);
+    } catch (err) {
+        console.error('Failed to pop log from database', err);
+        addMessage('Log removed locally but failed to remove from database.', false);
+    }
+});
+
+updateStackSizeLabel();
 
 // Input copy button
 const inputCopyBtn = document.getElementById('input-copy-btn');
