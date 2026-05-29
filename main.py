@@ -1,3 +1,4 @@
+from fastapi.responses import JSONResponse
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
@@ -9,11 +10,18 @@ import datetime
 from fastapi.staticfiles import StaticFiles
 import threading
 
+# ====================== MYSQL CONNECTOR (SAFE IMPORT) ======================
+mysql_connector = None
 try:
     import mysql.connector
+    mysql_connector = mysql.connector
+    print("✅ MySQL connector loaded successfully")
 except ModuleNotFoundError:
-    mysql.connector = None
+    print("⚠️  mysql-connector-python is not installed. Database logging will be disabled.")
+except Exception as e:
+    print(f"⚠️  Error loading MySQL connector: {e}")
 
+# ====================== LANGCHAIN & OTHER IMPORTS ======================
 LANGCHAIN_AVAILABLE = True
 try:
     from langchain_community.document_loaders import PyPDFLoader
@@ -27,6 +35,8 @@ try:
     from langchain_community.chat_message_histories import ChatMessageHistory
 except ModuleNotFoundError:
     LANGCHAIN_AVAILABLE = False
+    print("⚠️  LangChain dependencies not fully installed.")
+
 
 IMAGE_RUNTIME_AVAILABLE = True
 try:
@@ -43,7 +53,6 @@ except ModuleNotFoundError:
     MarkdownPdf = None
     Section = None
 
-# ====================== CONFIG ======================
 WORKSPACE_DIR = os.path.dirname(__file__)
 
 PDF_PATHS = [
@@ -103,21 +112,6 @@ class PopPayload(BaseModel):
 chat_stack = []
 
 
-def get_conn():
-    if mysql.connector is None:
-        raise HTTPException(status_code=503, detail="MySQL connector is not installed")
-    return mysql.connector.connect(**DB_CONFIG)
-
-
-def to_utc_datetime(iso_str: str) -> datetime.datetime:
-    try:
-        parsed = datetime.datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail="Invalid ISO timestamp") from exc
-
-    if parsed.tzinfo is None:
-        return parsed.replace(tzinfo=datetime.timezone.utc)
-    return parsed.astimezone(datetime.timezone.utc)
 
 # ====================== LOAD PDFs ======================
 docs = []
@@ -200,6 +194,7 @@ if IMAGE_RUNTIME_AVAILABLE:
     except Exception as exc:
         print("Image model unavailable:", exc)
         pipe = None
+
 
 def generate_image_task(prompt, path, image_id):
 
@@ -298,6 +293,92 @@ def save_chat_log(payload: ChatLogPayload):
 
     return {"status": "saved", "stack_size": len(chat_stack)}
 
+@app.post("/upload")
+async def upload_file(file: UploadFile = File(...)):
+    try:
+        if not file.filename.lower().endswith('.pdf'):
+            raise HTTPException(status_code=400, detail="Only PDF files are allowed")
+
+        file_path = os.path.join(UPLOAD_DIR, file.filename)
+        
+        # Save file
+        with open(file_path, "wb") as f:
+            f.write(await file.read())
+
+        # === ADD TO RAG VECTORSTORE ===
+        if LANGCHAIN_AVAILABLE and vectorstore is not None:
+            try:
+                loader = PyPDFLoader(file_path)
+                new_docs = loader.load()
+                text_splitter = RecursiveCharacterTextSplitter(chunk_size=1500, chunk_overlap=300)
+                new_splits = text_splitter.split_documents(new_docs)
+                
+                vectorstore.add_documents(new_splits)
+                print(f"✅ Added {len(new_splits)} new chunks from: {file.filename}")
+                
+                global retriever
+                retriever = vectorstore.as_retriever(search_kwargs={"k": 8})  # Increase k a bit
+            except Exception as e:
+                print(f"⚠️ Failed to add document to vectorstore: {e}")
+
+        return JSONResponse({
+            "status": "success",
+            "message": f"File '{file.filename}' uploaded and learned successfully!",
+            "path": file_path
+        })
+    except Exception as e:
+        print(f"Upload error: {e}")
+        raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
+
+# ====================== DB HELPERS ======================
+def get_conn():
+    if mysql_connector is None:
+        raise HTTPException(status_code=503, detail="MySQL connector is not installed")
+    return mysql_connector.connect(**DB_CONFIG)
+
+def to_utc_datetime(iso_str: str) -> datetime.datetime:
+    try:
+        parsed = datetime.datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid ISO timestamp") from exc
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=datetime.timezone.utc)
+    return parsed.astimezone(datetime.timezone.utc)
+
+def save_chat_to_db(log_id: str, user_prompt: str, nexa_response: str):
+    """Save chat to MySQL database"""
+    if mysql_connector is None:
+        print("⚠️ DB logging skipped: mysql connector not installed")
+        return
+
+    conn = None
+    cur = None
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        cur.execute(
+            """
+            INSERT INTO nexa_chat_logs 
+            (log_id, user_name, user_prompt, nexa_response, timestamp_utc, stars)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE
+                user_prompt = VALUES(user_prompt),
+                nexa_response = VALUES(nexa_response),
+                timestamp_utc = VALUES(timestamp_utc)
+            """,
+            (log_id, TEST_USER_NAME, user_prompt, nexa_response, ts, 0)
+        )
+        conn.commit()
+        print(f"✅ Saved to DB: {log_id}")
+    except Exception as e:
+        print(f"⚠️ DB Save Error: {e}")
+    finally:
+        if cur:
+            cur.close()
+        if conn:
+            conn.close()
 
 @app.post("/api/chat-rating")
 def save_rating(payload: RatingPayload):
@@ -356,12 +437,12 @@ class ChatResponse(BaseModel):
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat_endpoint(request: ChatRequest):
-
     session_id = request.session_id or str(uuid.uuid4())
+    log_id = str(uuid.uuid4())
 
     try:
         config = {"configurable": {"session_id": session_id}}
-
+        
         if conversational_rag_chain is None:
             answer = "Chat is available, but the curriculum model dependencies are not installed in this workspace."
         else:
@@ -369,57 +450,51 @@ async def chat_endpoint(request: ChatRequest):
                 {"input": request.message},
                 config=config
             )
-
             answer = result.get("answer") or "No response"
 
         pdf_url = None
         image_url = None
         image_id = None
 
-        # ================= PDF GENERATION (UNCHANGED) =================
+        # ================= PDF GENERATION =================
         if "pdf" in request.message.lower():
             if MarkdownPdf is not None and Section is not None:
                 ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
                 filename = f"lesson_{ts}.pdf"
                 path = os.path.join(IMAGE_OUTPUT_DIR, filename)
-
                 pdf = MarkdownPdf()
                 pdf.add_section(Section(answer))
                 pdf.save(path)
-
                 pdf_url = f"/assets/{filename}"
 
-        # ================= IMAGE GENERATION (FIXED + SAFE) =================
-        if any(k in request.message.lower() for k in ["image", "diagram", "draw", "visual"]):
-
+        # ================= IMAGE GENERATION (50 Steps) =================
+        if any(k in request.message.lower() for k in ["image", "diagram", "draw", "visual", "picture", "illustration"]):
             if pipe is None:
-                answer = "Your image request was received, but image generation is unavailable in this workspace."
-                return ChatResponse(
-                    response=answer,
-                    session_id=session_id,
-                    pdf_url=pdf_url,
-                    image_url=None,
-                    image_id=None
-                )
+                answer = "Image generation is not available in this workspace."
+            else:
+                answer = "🖼️ Generating high-quality image (50 steps)... Please wait 30-60 seconds."
+                ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                filename = f"image_{ts}.png"
+                path = os.path.join(IMAGE_OUTPUT_DIR, filename)
+                image_id = ts
+                
+                enhanced_prompt = f"{request.message}, educational diagram, clear labels, textbook style, high quality, simple background, well organized"
 
-            answer = "Your image is generating..."
+                # Start background generation
+                threading.Thread(
+                    target=generate_image_task,
+                    args=(enhanced_prompt, path, image_id),
+                    daemon=True
+                ).start()
+                
+                image_url = f"/assets/{filename}"
 
-            ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        # Safety check
+        if not answer or str(answer).strip() == "":
+            answer = "Sorry, I couldn't generate a proper response. Please try again."
 
-            filename = f"image_{ts}.png"
-            path = os.path.join(IMAGE_OUTPUT_DIR, filename)
-
-            image_id = ts  # ✅ IMPORTANT for frontend polling
-
-            prompt = f"{request.message}. educational diagram, clean labels, high quality, textbook style"
-
-            # 🔥 NON-BLOCKING BACKGROUND THREAD (UNCHANGED LOGIC)
-            threading.Thread(
-                target=generate_image_task,
-                args=(prompt, path, image_id)
-            ).start()
-
-            image_url = f"/assets/{filename}"
+        # Save conversation to database
+        save_chat_to_db(log_id, request.message, answer)
 
         return ChatResponse(
             response=answer,
@@ -430,7 +505,7 @@ async def chat_endpoint(request: ChatRequest):
         )
 
     except Exception as e:
-        print(e)
+        print("Chat Endpoint Error:", e)
         raise HTTPException(status_code=500, detail="Server error")
 
 @app.get("/image-status/{image_id}")

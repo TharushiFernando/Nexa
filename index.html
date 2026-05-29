@@ -673,9 +673,6 @@
         <div id="chat-messages" class="flex-1 p-6 overflow-y-auto bg-gray-50 space-y-7"></div>
         <!-- Input Area -->
         <div id="input-area" class="px-3 py-3 border-t bg-white">
-            <div class="guardrail-banner">
-                Student Safety Guardrail is ON. Nexa blocks harmful, explicit, hateful, violent, self-harm, cheating, and privacy-invasive requests.
-            </div>
             <div class="mb-2">
                 <input id="user-name" type="text"
                        class="w-full border border-gray-300 rounded-2xl px-4 py-2.5 focus:outline-none focus:border-gray-400 text-sm"
@@ -699,8 +696,8 @@
                 </button>
             </div>
             <div class="logger-toolbar">
-                <span id="stack-size">Logs in stack: 0</span>
-                <button id="undo-log-btn" class="toolbar-btn" type="button">Undo Last Log (Pop)</button>
+                <span id="stack-size"></span>
+                <button id="undo-log-btn" class="toolbar-btn" type="button"></button>
             </div>
         </div>
     </div>
