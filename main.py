@@ -7,7 +7,7 @@ import html
 import uuid
 import os
 import re
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 import datetime
 from fastapi.staticfiles import StaticFiles
 import threading
@@ -100,6 +100,8 @@ class ChatLogPayload(BaseModel):
     user_prompt: str
     nexa_response: str
     timestamp: str
+    session_id: Optional[str] = None
+    user_email: Optional[str] = None
     stars: int = 0
 
 
@@ -261,6 +263,108 @@ def record_chat_turn(session_id: str, role: str, content: str) -> None:
 
 def serialize_chat_history(session_id: str):
     return SESSION_CHAT_HISTORY.get(session_id, [])
+
+
+def ensure_chat_log_schema():
+    if mysql.connector is None:
+        return
+
+    conn = None
+    cur = None
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+
+        cur.execute("SHOW COLUMNS FROM nexa_chat_logs LIKE 'session_id'")
+        if cur.fetchone() is None:
+            cur.execute("ALTER TABLE nexa_chat_logs ADD COLUMN session_id VARCHAR(64) NULL AFTER log_id")
+
+        cur.execute("SHOW COLUMNS FROM nexa_chat_logs LIKE 'user_email'")
+        if cur.fetchone() is None:
+            cur.execute("ALTER TABLE nexa_chat_logs ADD COLUMN user_email VARCHAR(255) NULL AFTER user_name")
+
+        conn.commit()
+    except Exception as exc:
+        print(f"Failed to ensure chat log schema: {exc}")
+    finally:
+        if cur is not None:
+            cur.close()
+        if conn is not None:
+            conn.close()
+
+
+def fetch_chat_history_rows(session_id: str):
+    if mysql.connector is None:
+        return []
+
+    conn = None
+    cur = None
+    try:
+        conn = get_conn()
+        cur = conn.cursor(dictionary=True)
+        cur.execute(
+            """
+            SELECT user_prompt, nexa_response, timestamp_utc
+            FROM nexa_chat_logs
+            WHERE session_id = %s
+            ORDER BY timestamp_utc ASC, id ASC
+            """,
+            (session_id,),
+        )
+        return cur.fetchall() or []
+    except Exception as exc:
+        print(f"Failed to fetch chat history from database: {exc}")
+        return []
+    finally:
+        if cur is not None:
+            cur.close()
+        if conn is not None:
+            conn.close()
+
+
+def fetch_user_chat_sessions(user_email: str):
+    normalized_email = normalize_email_address(user_email)
+    if mysql.connector is None or not normalized_email:
+        return []
+
+    conn = None
+    cur = None
+    try:
+        conn = get_conn()
+        cur = conn.cursor(dictionary=True)
+        cur.execute(
+            """
+            SELECT session_id, MAX(timestamp_utc) AS last_activity, COUNT(*) AS message_count
+            FROM nexa_chat_logs
+            WHERE user_email = %s
+              AND session_id IS NOT NULL
+              AND session_id <> ''
+            GROUP BY session_id
+            ORDER BY last_activity DESC, session_id DESC
+            LIMIT 20
+            """,
+            (normalized_email,),
+        )
+        rows = cur.fetchall() or []
+        sessions = []
+        for row in rows:
+            last_activity = row.get("last_activity")
+            sessions.append(
+                {
+                    "session_id": row.get("session_id") or "",
+                    "last_activity": last_activity.isoformat() if hasattr(last_activity, "isoformat") else str(last_activity),
+                    "message_count": int(row.get("message_count") or 0),
+                }
+            )
+        return sessions
+    except Exception as exc:
+        print(f"Failed to fetch user chat sessions: {exc}")
+        return []
+    finally:
+        if cur is not None:
+            cur.close()
+        if conn is not None:
+            conn.close()
 
 
 def normalize_email_address(email: Optional[str]) -> str:
@@ -441,6 +545,11 @@ app.add_middleware(
     allow_headers=["*"]
 )
 
+
+@app.on_event("startup")
+def startup_tasks():
+    ensure_chat_log_schema()
+
 app.mount("/assets", StaticFiles(directory=IMAGE_OUTPUT_DIR), name="assets")
 
 @app.get("/", response_class=HTMLResponse)
@@ -465,9 +574,11 @@ def save_chat_log(payload: ChatLogPayload):
         ts_utc = to_utc_datetime(payload.timestamp)
         cur.execute(
             """
-            INSERT INTO nexa_chat_logs (log_id, user_name, user_prompt, nexa_response, timestamp_utc, stars)
-            VALUES (%s, %s, %s, %s, %s, %s)
+            INSERT INTO nexa_chat_logs (log_id, session_id, user_email, user_name, user_prompt, nexa_response, timestamp_utc, stars)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
             ON DUPLICATE KEY UPDATE
+                session_id = VALUES(session_id),
+                user_email = VALUES(user_email),
                 user_name = VALUES(user_name),
                 user_prompt = VALUES(user_prompt),
                 nexa_response = VALUES(nexa_response),
@@ -476,6 +587,8 @@ def save_chat_log(payload: ChatLogPayload):
             """,
             (
                 payload.log_id,
+                payload.session_id,
+                normalize_email_address(payload.user_email),
                 payload.user_name,
                 payload.user_prompt,
                 payload.nexa_response,
@@ -638,6 +751,17 @@ class ChatHistoryResponse(BaseModel):
     session_id: str
     messages: Any
 
+
+class ChatSessionSummary(BaseModel):
+    session_id: str
+    last_activity: str
+    message_count: int
+
+
+class ChatSessionListResponse(BaseModel):
+    user_email: str
+    sessions: List[ChatSessionSummary]
+
 @app.post("/chat", response_model=ChatResponse)
 async def chat_endpoint(request: ChatRequest):
 
@@ -732,9 +856,32 @@ async def chat_endpoint(request: ChatRequest):
 
 @app.get("/api/chat-history/{session_id}", response_model=ChatHistoryResponse)
 def get_chat_history(session_id: str):
+    messages = []
+
+    for row in fetch_chat_history_rows(session_id):
+        user_prompt = (row.get("user_prompt") or "").strip()
+        nexa_response = (row.get("nexa_response") or "").strip()
+
+        if user_prompt:
+            messages.append({"role": "user", "content": user_prompt})
+        if nexa_response:
+            messages.append({"role": "assistant", "content": nexa_response})
+
+    if not messages:
+        messages = serialize_chat_history(session_id)
+
     return {
         "session_id": session_id,
-        "messages": serialize_chat_history(session_id),
+        "messages": messages,
+    }
+
+
+@app.get("/api/chat-sessions/{user_email}", response_model=ChatSessionListResponse)
+def get_chat_sessions(user_email: str):
+    normalized_email = normalize_email_address(user_email)
+    return {
+        "user_email": normalized_email,
+        "sessions": fetch_user_chat_sessions(normalized_email),
     }
 
 @app.get("/image-status/{image_id}")
