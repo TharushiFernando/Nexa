@@ -661,6 +661,20 @@
             #feedback-modal     { width: 560px !important; padding: 44px 38px 34px !important; }
         }
 
+        /* ── Expanded width mode ── */
+        #chat-window.chat-expanded {
+            width: min(820px, calc(100vw - 3rem)) !important;
+            transition: width 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+        }
+        #chat-window {
+            transition: width 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+        }
+        @media (max-width: 480px) {
+            #chat-window.chat-expanded {
+                width: calc(100vw - 12px) !important;
+            }
+        }
+
         /* ── Input area ── */
         #user-input {
             min-width: 0;
@@ -687,16 +701,15 @@
         }
     </style>
 </head>
-<body class="bg-gray-900 font-sans">
+<body class="font-sans" style="background:transparent;">
     <!-- Floating Chat Button -->
     <div id="chat-button" class="fixed z-50 cursor-pointer">
-        <div class="flex items-center gap-3">
-            <div class="w-20 h-20">
-                <img id="nexa-logo" src="assets/nexa.png" class="w-full h-full object-contain glowing-gold-logo" alt="Nexa Logo"/>
+        <div class="flex flex-col items-end gap-2">
+            <div id="hover-container" class="bg-white rounded-3xl px-5 py-3 shadow-xl flex items-center gap-3 opacity-0 scale-95 transition-all duration-300 origin-bottom-right">
+                <div class="text-gray-800 text-sm font-medium whitespace-nowrap">Hello! I'm Nexa. How can I help?</div>
             </div>
-            <div id="hover-container" class="bg-white rounded-3xl px-6 py-4 shadow-xl flex items-center gap-3 opacity-0 scale-95 transition-all duration-300">
-                <div class="text-gray-800 text-sm font-medium">Hello! I'm Nexa. How can I help?</div>
-                <div class="w-10 h-10 bg-yellow-400 text-gray-900 rounded-2xl flex items-center justify-center text-2xl shadow">↑</div>
+            <div class="w-20 h-20">
+                <img id="nexa-logo" src="assets/edunex.png" class="w-full h-full object-contain glowing-gold-logo" alt="EduNeX Logo"/>
             </div>
         </div>
     </div>
@@ -715,6 +728,9 @@
             </div>
             <div class="flex items-center gap-2">
                 <button id="history-toggle-btn" class="toolbar-btn history-toggle-btn text-xs font-semibold" type="button">History</button>
+                <button id="expand-chat" title="Expand width" class="text-gray-500 hover:text-gray-700 transition-colors flex items-center justify-center" style="width:32px;height:32px;border-radius:8px;background:none;border:none;cursor:pointer;font-size:17px;">
+                    <i id="expand-icon" class="fa-solid fa-up-right-and-down-left-from-center"></i>
+                </button>
                 <button id="close-chat" class="text-gray-500 hover:text-gray-700 text-2xl transition-colors">✕</button>
             </div>
         </div>
@@ -798,6 +814,25 @@ const messagesContainer = document.getElementById('chat-messages');
 const userEmailInput = document.getElementById('user-email');
 const userInput = document.getElementById('user-input');
 const userNameInput = document.getElementById('user-name');
+
+// ==================== EXPAND / COLLAPSE WIDTH TOGGLE ====================
+const expandBtn  = document.getElementById('expand-chat');
+const expandIcon = document.getElementById('expand-icon');
+let chatExpanded = false;
+
+expandBtn.addEventListener('click', () => {
+    chatExpanded = !chatExpanded;
+    chatWindow.classList.toggle('chat-expanded', chatExpanded);
+    if (chatExpanded) {
+        expandIcon.classList.remove('fa-up-right-and-down-left-from-center');
+        expandIcon.classList.add('fa-down-left-and-up-right-to-center');
+        expandBtn.title = 'Reduce width';
+    } else {
+        expandIcon.classList.remove('fa-down-left-and-up-right-to-center');
+        expandIcon.classList.add('fa-up-right-and-down-left-from-center');
+        expandBtn.title = 'Expand width';
+    }
+});
 const accessRoleBadge = document.getElementById('access-role-badge');
 const sendButton = document.getElementById('send-button');
 const attachBtn = document.getElementById('attach-btn');
