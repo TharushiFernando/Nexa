@@ -966,9 +966,16 @@ function renderHistoryTranscript(messages) {
     historySessionDetail.innerHTML = messages.map(message => {
         const isUser = message.role === 'user';
         const bubbleClass = isUser ? 'bg-slate-900 text-white' : 'bg-sky-50 text-slate-800';
+        const imageMarkup = !isUser && message.image_url
+            ? `
+                <div class="generated-image mt-4">
+                    <img src="${escapeHtml(message.image_url)}" alt="Generated Image" title="Click to preview">
+                </div>
+            `
+            : '';
         const text = isUser
             ? `<div class="whitespace-pre-wrap break-words text-sm leading-6">${escapeHtml(message.content || '')}</div>`
-            : `<div class="markdown-body text-sm">${renderMarkdown(message.content || '')}</div>`;
+            : `<div class="markdown-body text-sm">${renderMarkdown(message.content || '')}</div>${imageMarkup}`;
 
         return `
             <div class="flex ${isUser ? 'justify-end' : 'justify-start'}">

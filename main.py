@@ -5,6 +5,7 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 import html
 import uuid
+from urllib.parse import quote_plus
 import os
 import re
 from typing import Optional, Dict, Any, List
@@ -282,6 +283,26 @@ def ensure_chat_log_schema():
         cur.execute("SHOW COLUMNS FROM nexa_chat_logs LIKE 'user_email'")
         if cur.fetchone() is None:
             cur.execute("ALTER TABLE nexa_chat_logs ADD COLUMN user_email VARCHAR(255) NULL AFTER user_name")
+        
+        cur.execute("SHOW COLUMNS FROM nexa_chat_logs LIKE 'image_base64'")
+        if cur.fetchone() is None:
+            cur.execute("ALTER TABLE nexa_chat_logs ADD COLUMN image_base64 LONGTEXT NULL AFTER nexa_response")
+        
+        cur.execute("SHOW COLUMNS FROM nexa_chat_logs LIKE 'image_blob'")
+        if cur.fetchone() is None:
+            cur.execute("ALTER TABLE nexa_chat_logs ADD COLUMN image_blob LONGBLOB NULL AFTER image_base64")
+        
+        cur.execute("SHOW COLUMNS FROM nexa_chat_logs LIKE 'image_mime_type'")
+        if cur.fetchone() is None:
+            cur.execute("ALTER TABLE nexa_chat_logs ADD COLUMN image_mime_type VARCHAR(100) NULL AFTER image_blob")
+        
+        cur.execute("SHOW COLUMNS FROM nexa_chat_logs LIKE 'image_filename'")
+        if cur.fetchone() is None:
+            cur.execute("ALTER TABLE nexa_chat_logs ADD COLUMN image_filename VARCHAR(255) NULL AFTER image_mime_type")
+        
+        cur.execute("SHOW COLUMNS FROM nexa_chat_logs LIKE 'image_saved_at'")
+        if cur.fetchone() is None:
+            cur.execute("ALTER TABLE nexa_chat_logs ADD COLUMN image_saved_at DATETIME NULL AFTER image_filename")
 
         conn.commit()
     except Exception as exc:
@@ -304,7 +325,7 @@ def fetch_chat_history_rows(session_id: str):
         cur = conn.cursor(dictionary=True)
         cur.execute(
             """
-            SELECT user_prompt, nexa_response, timestamp_utc
+            SELECT log_id, user_name, user_prompt, nexa_response, image_base64, image_mime_type, image_filename, timestamp_utc
             FROM nexa_chat_logs
             WHERE session_id = %s
             ORDER BY timestamp_utc ASC, id ASC
@@ -742,7 +763,7 @@ def save_chat_image(payload: ImageBase64Payload):
         image_base64 = image_base64.split(",", 1)[1]
 
     try:
-        base64.b64decode(image_base64, validate=True)
+        image_blob = base64.b64decode(image_base64, validate=True)
     except Exception as exc:
         raise HTTPException(status_code=400, detail="Invalid base64 image payload") from exc
 
@@ -753,6 +774,7 @@ def save_chat_image(payload: ImageBase64Payload):
             """
             UPDATE nexa_chat_logs
             SET image_base64 = %s,
+                image_blob = %s,
                 image_mime_type = %s,
                 image_filename = %s,
                 image_saved_at = %s
@@ -760,6 +782,7 @@ def save_chat_image(payload: ImageBase64Payload):
             """,
             (
                 image_base64,
+                image_blob,
                 mime_type,
                 image_filename,
                 datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
@@ -785,7 +808,7 @@ def get_chat_image(log_id: str, user_name: str):
     try:
         cur.execute(
             """
-            SELECT image_base64, image_mime_type, image_filename
+            SELECT image_base64, image_blob, image_mime_type, image_filename
             FROM nexa_chat_logs
             WHERE log_id = %s AND user_name = %s
             """,
@@ -799,11 +822,14 @@ def get_chat_image(log_id: str, user_name: str):
     if not row or row[0] is None:
         raise HTTPException(status_code=404, detail="Image not found")
 
-    image_base64, image_mime_type, image_filename = row
-    try:
-        image_bytes = base64.b64decode(image_base64)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail="Stored base64 image is invalid") from exc
+    image_base64, image_blob, image_mime_type, image_filename = row
+    if image_blob is not None:
+        image_bytes = image_blob
+    else:
+        try:
+            image_bytes = base64.b64decode(image_base64)
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail="Stored base64 image is invalid") from exc
 
     headers = {}
     if image_filename:
@@ -951,13 +977,25 @@ def get_chat_history(session_id: str):
     messages = []
 
     for row in fetch_chat_history_rows(session_id):
+        log_id = (row.get("log_id") or "").strip()
+        user_name = (row.get("user_name") or "").strip()
         user_prompt = (row.get("user_prompt") or "").strip()
         nexa_response = (row.get("nexa_response") or "").strip()
+        image_base64 = (row.get("image_base64") or "").strip()
+        image_mime_type = (row.get("image_mime_type") or "").strip()
+        image_filename = (row.get("image_filename") or "").strip()
 
         if user_prompt:
             messages.append({"role": "user", "content": user_prompt})
         if nexa_response:
-            messages.append({"role": "assistant", "content": nexa_response})
+            message = {"role": "assistant", "content": nexa_response}
+            if image_base64 and log_id and user_name:
+                message["image_url"] = f"/api/chat-image/{log_id}?user_name={quote_plus(user_name)}"
+                if image_mime_type:
+                    message["image_mime_type"] = image_mime_type
+                if image_filename:
+                    message["image_filename"] = image_filename
+            messages.append(message)
 
     if not messages:
         messages = serialize_chat_history(session_id)
