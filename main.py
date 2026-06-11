@@ -5,6 +5,7 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 import html
 import uuid
+import secrets
 from urllib.parse import quote_plus
 import os
 import re
@@ -123,6 +124,23 @@ class ImageBase64Payload(BaseModel):
     image_base64: str
     image_filename: Optional[str] = None
     image_mime_type: Optional[str] = None
+
+
+class ShareChatPayload(BaseModel):
+    session_id: str
+    user_email: Optional[str] = None
+
+
+class ShareChatResponse(BaseModel):
+    share_token: str
+    share_url: str
+
+
+class SharedChatResponse(BaseModel):
+    share_token: str
+    session_id: str
+    created_at_utc: str
+    messages: Any
 
 
 # Server-side stack to mirror push/pop operations done by the UI.
@@ -304,6 +322,24 @@ def ensure_chat_log_schema():
         if cur.fetchone() is None:
             cur.execute("ALTER TABLE nexa_chat_logs ADD COLUMN image_saved_at DATETIME NULL AFTER image_filename")
 
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS nexa_shared_chats (
+                id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+                share_token VARCHAR(128) NOT NULL,
+                session_id VARCHAR(64) NOT NULL,
+                created_by_email VARCHAR(255) NULL,
+                created_at_utc DATETIME NOT NULL,
+                expires_at_utc DATETIME NULL,
+                is_active TINYINT(1) NOT NULL DEFAULT 1,
+                PRIMARY KEY (id),
+                UNIQUE KEY uq_share_token (share_token),
+                KEY idx_session_id (session_id),
+                KEY idx_created_by_email (created_by_email),
+                KEY idx_is_active (is_active)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        """)
+
         conn.commit()
     except Exception as exc:
         print(f"Failed to ensure chat log schema: {exc}")
@@ -472,6 +508,87 @@ def search_user_chat_sessions(user_email: str, query: str, limit: int = 10):
 
 def normalize_email_address(email: Optional[str]) -> str:
     return (email or "").strip().lower()
+
+
+
+
+def session_belongs_to_user(session_id: str, user_email: Optional[str]) -> bool:
+    normalized_email = normalize_email_address(user_email)
+
+    if not normalized_email:
+        return True
+
+    conn = None
+    cur = None
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT COUNT(*)
+            FROM nexa_chat_logs
+            WHERE session_id = %s
+              AND user_email = %s
+            """,
+            (session_id, normalized_email),
+        )
+        count = cur.fetchone()[0]
+        return count > 0
+    except Exception as exc:
+        print(f"Failed to verify chat ownership: {exc}")
+        return False
+    finally:
+        if cur is not None:
+            cur.close()
+        if conn is not None:
+            conn.close()
+
+
+def create_share_record(session_id: str, user_email: Optional[str]) -> str:
+    share_token = secrets.token_urlsafe(32)
+    created_at = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            INSERT INTO nexa_shared_chats
+                (share_token, session_id, created_by_email, created_at_utc, is_active)
+            VALUES
+                (%s, %s, %s, %s, 1)
+            """,
+            (
+                share_token,
+                session_id,
+                normalize_email_address(user_email),
+                created_at,
+            ),
+        )
+        conn.commit()
+        return share_token
+    finally:
+        cur.close()
+        conn.close()
+
+
+def get_share_record(share_token: str):
+    conn = get_conn()
+    cur = conn.cursor(dictionary=True)
+    try:
+        cur.execute(
+            """
+            SELECT share_token, session_id, created_at_utc, expires_at_utc, is_active
+            FROM nexa_shared_chats
+            WHERE share_token = %s
+            LIMIT 1
+            """,
+            (share_token,),
+        )
+        return cur.fetchone()
+    finally:
+        cur.close()
+        conn.close()
 
 
 def _load_email_tokens(env_name: str) -> set[str]:
@@ -839,6 +956,190 @@ def get_chat_image(log_id: str, user_name: str):
     from fastapi.responses import StreamingResponse
 
     return StreamingResponse(BytesIO(image_bytes), media_type=image_mime_type or "application/octet-stream", headers=headers)
+
+
+
+@app.post("/api/share-chat", response_model=ShareChatResponse)
+def share_chat(payload: ShareChatPayload):
+    session_id = (payload.session_id or "").strip()
+    user_email = normalize_email_address(payload.user_email)
+
+    if not session_id:
+        raise HTTPException(status_code=400, detail="session_id is required")
+
+    if not session_belongs_to_user(session_id, user_email):
+        raise HTTPException(status_code=403, detail="You can only share your own chat session")
+
+    rows = fetch_chat_history_rows(session_id)
+    if not rows:
+        raise HTTPException(status_code=404, detail="No saved chat logs found for this session")
+
+    share_token = create_share_record(session_id, user_email)
+    share_url = f"/share/{share_token}"
+
+    return {
+        "share_token": share_token,
+        "share_url": share_url,
+    }
+
+
+@app.get("/api/shared-chat/{share_token}", response_model=SharedChatResponse)
+def get_shared_chat_data(share_token: str):
+    share = get_share_record(share_token)
+
+    if not share or not share.get("is_active"):
+        raise HTTPException(status_code=404, detail="Shared chat link not found")
+
+    expires_at = share.get("expires_at_utc")
+    if expires_at:
+        now_utc_naive = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+        if expires_at < now_utc_naive:
+            raise HTTPException(status_code=410, detail="Shared chat link has expired")
+
+    session_id = share.get("session_id")
+    messages = []
+
+    for row in fetch_chat_history_rows(session_id):
+        log_id = (row.get("log_id") or "").strip()
+        user_name = (row.get("user_name") or "").strip()
+        user_prompt = (row.get("user_prompt") or "").strip()
+        nexa_response = (row.get("nexa_response") or "").strip()
+        image_base64 = (row.get("image_base64") or "").strip()
+        image_mime_type = (row.get("image_mime_type") or "").strip()
+        image_filename = (row.get("image_filename") or "").strip()
+
+        if user_prompt:
+            messages.append({
+                "role": "user",
+                "content": user_prompt,
+            })
+
+        if nexa_response:
+            assistant_message = {
+                "role": "assistant",
+                "content": nexa_response,
+            }
+
+            if image_base64 and log_id and user_name:
+                assistant_message["image_url"] = f"/api/chat-image/{log_id}?user_name={quote_plus(user_name)}"
+
+            if image_mime_type:
+                assistant_message["image_mime_type"] = image_mime_type
+
+            if image_filename:
+                assistant_message["image_filename"] = image_filename
+
+            messages.append(assistant_message)
+
+    created_at = share.get("created_at_utc")
+
+    return {
+        "share_token": share_token,
+        "session_id": session_id,
+        "created_at_utc": created_at.isoformat() if hasattr(created_at, "isoformat") else str(created_at),
+        "messages": messages,
+    }
+
+
+@app.get("/share/{share_token}", response_class=HTMLResponse)
+def shared_chat_page(share_token: str):
+    safe_token = html.escape(share_token)
+
+    return HTMLResponse(f'''
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Shared Nexa Chat</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+</head>
+<body class="bg-slate-100 min-h-screen">
+    <main class="max-w-4xl mx-auto px-4 py-8">
+        <div class="bg-white rounded-3xl shadow-xl border border-slate-200 overflow-hidden">
+            <div class="px-6 py-5 border-b border-slate-200 bg-slate-50 flex items-center justify-between gap-4">
+                <div>
+                    <h1 class="text-2xl font-bold text-slate-900">Shared Nexa Chat</h1>
+                    <p class="text-sm text-slate-500 mt-1">Read-only external chat view</p>
+                </div>
+                <span class="text-xs bg-amber-100 text-amber-800 px-3 py-2 rounded-full font-semibold">Public link</span>
+            </div>
+
+            <div id="chat-content" class="p-6 space-y-5">
+                <p class="text-slate-500">Loading shared chat...</p>
+            </div>
+        </div>
+    </main>
+
+<script>
+const SHARE_TOKEN = "{safe_token}";
+
+function escapeHtml(str) {{
+    return String(str || "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+}}
+
+async function loadSharedChat() {{
+    const container = document.getElementById("chat-content");
+
+    try {{
+        const res = await fetch(`/api/shared-chat/${{encodeURIComponent(SHARE_TOKEN)}}`);
+
+        if (!res.ok) {{
+            container.innerHTML = `<p class="text-red-600 font-medium">This shared chat link is unavailable or expired.</p>`;
+            return;
+        }}
+
+        const data = await res.json();
+        const messages = Array.isArray(data.messages) ? data.messages : [];
+
+        if (!messages.length) {{
+            container.innerHTML = `<p class="text-slate-500">No messages found in this shared chat.</p>`;
+            return;
+        }}
+
+        container.innerHTML = messages.map(message => {{
+            const isUser = message.role === "user";
+            const imageHtml = message.image_url
+                ? `<img src="${{escapeHtml(message.image_url)}}" class="mt-4 max-w-full rounded-2xl border border-slate-200" alt="Shared Nexa image">`
+                : "";
+
+            if (isUser) {{
+                return `
+                    <div class="flex justify-end">
+                        <div class="max-w-[85%] bg-slate-900 text-white rounded-2xl rounded-br-md px-5 py-3 whitespace-pre-wrap break-words">
+                            ${{escapeHtml(message.content)}}
+                        </div>
+                    </div>
+                `;
+            }}
+
+            return `
+                <div class="flex justify-start">
+                    <div class="max-w-[92%] bg-sky-50 text-slate-800 rounded-2xl rounded-bl-md px-5 py-4 break-words">
+                        <div class="prose max-w-none">${{marked.parse(message.content || "")}}</div>
+                        ${{imageHtml}}
+                    </div>
+                </div>
+            `;
+        }}).join("");
+
+    }} catch (err) {{
+        container.innerHTML = `<p class="text-red-600 font-medium">Failed to load shared chat.</p>`;
+    }}
+}}
+
+loadSharedChat();
+</script>
+</body>
+</html>
+    ''')
+
 
 # ====================== CHAT ======================
 class ChatRequest(BaseModel):
