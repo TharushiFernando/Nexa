@@ -735,6 +735,7 @@
             </div>
             <div class="flex items-center gap-2">
                 <button id="history-toggle-btn" class="toolbar-btn history-toggle-btn text-xs font-semibold" type="button">History</button>
+                <button id="share-chat-btn" class="toolbar-btn text-xs font-semibold" type="button">Share</button>
                 <button id="expand-chat" title="Expand width" class="text-gray-500 hover:text-gray-700 transition-colors flex items-center justify-center" style="width:32px;height:32px;border-radius:8px;background:none;border:none;cursor:pointer;font-size:17px;">
                     <i id="expand-icon" class="fa-solid fa-up-right-and-down-left-from-center"></i>
                 </button>
@@ -822,6 +823,7 @@ const IMAGE_API_URL = "/api/chat-image";
 const CHAT_HISTORY_API_URL = "/api/chat-history";
 const CHAT_SESSIONS_API_URL = "/api/chat-sessions";
 const CHAT_SESSION_SEARCH_API_URL = "/api/chat-sessions";
+const SHARE_CHAT_API_URL = "/api/share-chat";
 
 const chatButton = document.getElementById('chat-button');
 const chatWindow = document.getElementById('chat-window');
@@ -865,6 +867,7 @@ const closeHistoryBtn = document.getElementById('close-history-btn');
 const historySearchInput = document.getElementById('history-search-input');
 const historySearchClearBtn = document.getElementById('history-search-clear-btn');
 const historySearchStatus = document.getElementById('history-search-status');
+const shareChatBtn = document.getElementById('share-chat-btn');
 
 let sessionId = null;
 let userMessageCount = 0;
@@ -1852,8 +1855,63 @@ async function sendMessage() {
     }
 }
 
+
+async function shareCurrentChat() {
+    const userEmail = normalizeEmail(userEmailInput.value);
+
+    if (!userEmail || !userEmail.includes('@')) {
+        addMessage('Please enter your email before sharing this chat.', false);
+        userEmailInput.focus();
+        return;
+    }
+
+    if (!sessionId) {
+        addMessage('No chat session available to share yet. Please ask Nexa at least one question first.', false);
+        return;
+    }
+
+    try {
+        shareChatBtn.disabled = true;
+        shareChatBtn.textContent = 'Sharing...';
+
+        const res = await fetch(SHARE_CHAT_API_URL, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                session_id: sessionId,
+                user_email: userEmail
+            })
+        });
+
+        const data = await res.json();
+
+        if (!res.ok) {
+            throw new Error(data.detail || `Share API returned ${res.status}`);
+        }
+
+        const fullShareUrl = new URL(data.share_url, window.location.origin).toString();
+
+        try {
+            await navigator.clipboard.writeText(fullShareUrl);
+            addMessage(`✅ Share link created and copied to clipboard:\n\n${fullShareUrl}`, false);
+        } catch (copyErr) {
+            addMessage(`✅ Share link created:\n\n${fullShareUrl}`, false);
+        }
+
+    } catch (err) {
+        console.error('Share failed', err);
+        addMessage('⚠️ Failed to create share link. Please check backend/database connection.', false);
+    } finally {
+        shareChatBtn.disabled = false;
+        shareChatBtn.textContent = 'Share';
+    }
+}
+
 // Event Listeners
 sendButton.addEventListener('click', sendMessage);
+shareChatBtn.addEventListener('click', shareCurrentChat);
 userInput.addEventListener('keypress', e => { if (e.key === 'Enter') sendMessage(); });
 chatButton.addEventListener('click', () => chatWindow.classList.toggle('hidden'));
 closeChat.addEventListener('click', () => chatWindow.classList.add('hidden'));
