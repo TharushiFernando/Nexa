@@ -58,6 +58,86 @@ except ModuleNotFoundError:
     MarkdownPdf = None
     Section = None
 
+import textwrap
+
+
+def _escape_pdf_text(text: str) -> str:
+    return text.replace('\\', '\\\\').replace('(', '\\(').replace(')', '\\)')
+
+
+def save_text_to_pdf(path: str, text: str) -> None:
+    lines = []
+    for paragraph in text.replace('\r\n', '\n').replace('\r', '\n').split('\n'):
+        wrapped = textwrap.wrap(paragraph, width=90) or ['']
+        lines.extend(wrapped)
+
+    lines_per_page = 50
+    page_texts = [lines[i:i + lines_per_page] for i in range(0, len(lines), lines_per_page)] or [[]]
+
+    objects = []
+    obj_id = 1
+
+    # Catalog
+    objects.append((obj_id, '<< /Type /Catalog /Pages 2 0 R >>'))
+    obj_id += 1
+
+    # Pages placeholder
+    pages_obj_id = obj_id
+    obj_id += 1
+
+    # Font object
+    font_obj_id = obj_id
+    objects.append((font_obj_id, '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>'))
+    obj_id += 1
+
+    page_ids = []
+    content_ids = []
+    for _page in page_texts:
+        page_ids.append(obj_id)
+        obj_id += 1
+    for _page in page_texts:
+        content_ids.append(obj_id)
+        obj_id += 1
+
+    # Page objects
+    for page_id, content_id in zip(page_ids, content_ids):
+        page_content = f'<< /Type /Page /Parent {pages_obj_id} 0 R /MediaBox [0 0 612 792] '
+        page_content += f'/Resources << /Font << /F1 {font_obj_id} 0 R >> >> /Contents {content_id} 0 R >>'
+        objects.append((page_id, page_content))
+
+    # Content objects
+    for content_id, page_lines in zip(content_ids, page_texts):
+        stream_lines = ['BT', '/F1 12 Tf', '72 720 Td']
+        for index, line in enumerate(page_lines):
+            escaped = _escape_pdf_text(line)
+            stream_lines.append(f'({escaped}) Tj')
+            if index < len(page_lines) - 1:
+                stream_lines.append('0 -14 Td')
+        stream_lines.append('ET')
+        stream_text = '\n'.join(stream_lines)
+        stream_bytes = stream_text.encode('latin-1', errors='replace')
+        content_obj = f'<< /Length {len(stream_bytes)} >>\nstream\n{stream_text}\nendstream'
+        objects.append((content_id, content_obj))
+
+    # Pages object after content populated
+    kids = ' '.join(f'{pid} 0 R' for pid in page_ids)
+    pages_obj = f'<< /Type /Pages /Kids [ {kids} ] /Count {len(page_ids)} >>'
+    objects.insert(1, (pages_obj_id, pages_obj))
+
+    with open(path, 'wb') as f:
+        catalog_offset = 0
+        offsets = []
+        for obj_id, obj_content in objects:
+            offsets.append(f.tell())
+            obj_bytes = f'{obj_id} 0 obj\n{obj_content}\nendobj\n'.encode('latin-1')
+            f.write(obj_bytes)
+        xref_offset = f.tell()
+        f.write(b'xref\n0 %d\n0000000000 65535 f \n' % (len(objects) + 1))
+        for offset in offsets:
+            f.write(f'{offset:010d} 00000 n \n'.encode('latin-1'))
+        f.write(b'trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n' % (len(objects) + 1))
+        f.write(f'{xref_offset}\n%%EOF\n'.encode('latin-1'))
+
 # ====================== CONFIG ======================
 WORKSPACE_DIR = os.path.dirname(__file__)
 
@@ -104,6 +184,7 @@ class ChatLogPayload(BaseModel):
     timestamp: str
     session_id: Optional[str] = None
     user_email: Optional[str] = None
+    pdf_url: Optional[str] = None
     stars: int = 0
 
 
@@ -322,6 +403,10 @@ def ensure_chat_log_schema():
         if cur.fetchone() is None:
             cur.execute("ALTER TABLE nexa_chat_logs ADD COLUMN image_saved_at DATETIME NULL AFTER image_filename")
 
+        cur.execute("SHOW COLUMNS FROM nexa_chat_logs LIKE 'pdf_url'")
+        if cur.fetchone() is None:
+            cur.execute("ALTER TABLE nexa_chat_logs ADD COLUMN pdf_url VARCHAR(255) NULL AFTER image_saved_at")
+
 
         cur.execute("""
             CREATE TABLE IF NOT EXISTS nexa_shared_chats (
@@ -361,7 +446,7 @@ def fetch_chat_history_rows(session_id: str):
         cur = conn.cursor(dictionary=True)
         cur.execute(
             """
-            SELECT log_id, user_name, user_prompt, nexa_response, image_base64, image_mime_type, image_filename, timestamp_utc
+            SELECT log_id, user_name, user_prompt, nexa_response, image_base64, image_mime_type, image_filename, pdf_url, timestamp_utc
             FROM nexa_chat_logs
             WHERE session_id = %s
             ORDER BY timestamp_utc ASC, id ASC
@@ -794,14 +879,15 @@ def save_chat_log(payload: ChatLogPayload):
         ts_utc = to_utc_datetime(payload.timestamp)
         cur.execute(
             """
-            INSERT INTO nexa_chat_logs (log_id, session_id, user_email, user_name, user_prompt, nexa_response, timestamp_utc, stars)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            INSERT INTO nexa_chat_logs (log_id, session_id, user_email, user_name, user_prompt, nexa_response, pdf_url, timestamp_utc, stars)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON DUPLICATE KEY UPDATE
                 session_id = VALUES(session_id),
                 user_email = VALUES(user_email),
                 user_name = VALUES(user_name),
                 user_prompt = VALUES(user_prompt),
                 nexa_response = VALUES(nexa_response),
+                pdf_url = VALUES(pdf_url),
                 timestamp_utc = VALUES(timestamp_utc),
                 stars = VALUES(stars)
             """,
@@ -812,6 +898,7 @@ def save_chat_log(payload: ChatLogPayload):
                 payload.user_name,
                 payload.user_prompt,
                 payload.nexa_response,
+                payload.pdf_url,
                 ts_utc.strftime("%Y-%m-%d %H:%M:%S"),
                 payload.stars,
             ),
@@ -1317,15 +1404,17 @@ async def chat_endpoint(request: ChatRequest):
 
         # ================= PDF GENERATION (UNCHANGED) =================
         if "pdf" in request.message.lower():
-            if MarkdownPdf is not None and Section is not None:
-                ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-                filename = f"lesson_{ts}.pdf"
-                path = os.path.join(IMAGE_OUTPUT_DIR, filename)
+            ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"lesson_{ts}.pdf"
+            path = os.path.join(IMAGE_OUTPUT_DIR, filename)
 
+            if MarkdownPdf is not None and Section is not None:
                 pdf = MarkdownPdf()
                 pdf.add_section(Section(answer))
                 pdf.save(path)
-
+                pdf_url = f"/assets/{filename}"
+            else:
+                save_text_to_pdf(path, answer)
                 pdf_url = f"/assets/{filename}"
 
         # ================= IMAGE GENERATION (FIXED + SAFE) =================
@@ -1393,6 +1482,7 @@ def get_chat_history(session_id: str):
 
         if user_prompt:
             messages.append({"role": "user", "content": user_prompt})
+        pdf_url = (row.get("pdf_url") or "").strip()
         if nexa_response:
             message = {"role": "assistant", "content": nexa_response}
             if image_base64 and log_id and user_name:
@@ -1401,6 +1491,8 @@ def get_chat_history(session_id: str):
                     message["image_mime_type"] = image_mime_type
                 if image_filename:
                     message["image_filename"] = image_filename
+            if pdf_url:
+                message["pdf_url"] = pdf_url
             messages.append(message)
 
     if not messages:

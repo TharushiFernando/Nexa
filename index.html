@@ -1325,11 +1325,14 @@ async function retryPendingLogs() {
     }
 }
 
-async function updateLogResponse(logId, responseText) {
+async function updateLogResponse(logId, responseText, pdfUrl = null) {
     const logItem = chatLogStack.find(item => item.log_id === logId);
     if (!logItem) return;
 
     logItem.nexa_response = responseText;
+    if (pdfUrl) {
+        logItem.pdf_url = pdfUrl;
+    }
     logItem.timestamp = getInternationalTimestamp();
     await saveChatLogToDatabase(logItem);
     await retryPendingLogs();
@@ -1695,6 +1698,7 @@ async function sendMessage() {
             user_name: userName,
             user_prompt: text,
             nexa_response: blockedReply,
+            pdf_url: null,
             timestamp: getInternationalTimestamp(),
             stars: 0
         };
@@ -1719,6 +1723,7 @@ async function sendMessage() {
         user_name: userName,
         user_prompt: text,
         nexa_response: '',
+        pdf_url: null,
         timestamp,
         stars: 0
     });
@@ -1794,7 +1799,7 @@ async function sendMessage() {
 	if (data.image_url && data.image_id) {
 
     addMessage(data.response, false, null, false, pairId, { logId, userName });
-    await updateLogResponse(logId, data.response || '');
+    await updateLogResponse(logId, data.response || '', data.pdf_url || null);
 
     const imageUrl = data.image_url;
     const imageId = data.image_id;
