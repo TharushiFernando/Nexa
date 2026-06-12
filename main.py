@@ -687,27 +687,16 @@ def infer_access_role(email: Optional[str]) -> str:
         raise HTTPException(status_code=400, detail="A valid email address is required")
 
     local_part, _, domain = normalized_email.partition("@")
-
-    teacher_emails = _load_email_tokens("NEXA_TEACHER_EMAILS")
-    student_emails = _load_email_tokens("NEXA_STUDENT_EMAILS")
-    teacher_domains = _load_email_tokens("NEXA_TEACHER_EMAIL_DOMAINS")
-    student_domains = _load_email_tokens("NEXA_STUDENT_EMAIL_DOMAINS")
-
-    if normalized_email in teacher_emails or domain in teacher_domains:
+    # Use explicit local-part markers used by EduNex accounts:
+    # - teacher accounts contain ".education" in the local-part (e.g. teacher.education@...)
+    # - student accounts contain ".edunex" in the local-part (e.g. student.edunex@...)
+    if ".education" in local_part:
         return "teacher"
 
-    if normalized_email in student_emails or domain in student_domains:
+    if ".edunex" in local_part:
         return "student"
 
-    teacher_keywords = ("teacher", "staff", "faculty", "educator", "instructor", "lecturer", "tutor", "prof")
-    student_keywords = ("student", "learner", "pupil", "scholar")
-
-    if any(keyword in local_part for keyword in teacher_keywords):
-        return "teacher"
-
-    if any(keyword in local_part for keyword in student_keywords):
-        return "student"
-
+    # Fallback: default to student
     return "student"
 
 
@@ -1381,6 +1370,20 @@ async def chat_endpoint(request: ChatRequest):
     session_id = request.session_id or str(uuid.uuid4())
     SESSION_ACCESS_PROFILE[session_id] = {"email": normalized_email, "role": access_role}
     record_chat_turn(session_id, "user", request.message)
+
+    # Block lesson-plan generation for non-teachers
+    lower_msg = (request.message or "").lower()
+    if any(phrase in lower_msg for phrase in ("lesson plan", "create lesson", "create a lesson", "make a lesson")) and access_role != "teacher":
+        answer = "Only teachers can create full lesson plans. Please sign in with a teacher EduNex account."
+        record_chat_turn(session_id, "assistant", answer)
+        return ChatResponse(
+            response=answer,
+            session_id=session_id,
+            access_role=access_role,
+            pdf_url=None,
+            image_url=None,
+            image_id=None,
+        )
 
     try:
         config = {"configurable": {"session_id": session_id}}

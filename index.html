@@ -894,12 +894,12 @@ function getSessionStorageKey(email) {
 function inferAccessRoleFromEmail(email) {
     const normalizedEmail = normalizeEmail(email);
     const localPart = normalizedEmail.split('@')[0] || '';
-
-    if (/(teacher|staff|faculty|educator|instructor|lecturer|tutor|prof)/.test(localPart)) {
+    // EduNex local-part rules: ".education" => teacher, ".edunex" => student
+    if (localPart.includes('.education')) {
         return 'teacher';
     }
 
-    if (/(student|learner|pupil|scholar)/.test(localPart)) {
+    if (localPart.includes('.edunex')) {
         return 'student';
     }
 
