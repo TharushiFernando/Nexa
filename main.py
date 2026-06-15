@@ -354,6 +354,53 @@ def build_general_knowledge_answer(message: str) -> str:
     return ""
 
 
+NEXA_FAQ_ANSWERS = {
+    "what is nexa ai": "NEXA AI is an educational AI assistant designed to support students, teachers, schools, and the Department of Education in Papua New Guinea.",
+    "who created nexa ai": "NEXA AI was developed by the engineering team at PowerX Technologies as part of the EduNeX Digital Education Ecosystem.",
+    "who owns nexa ai": "NEXA AI is part of the EduNeX platform and is managed by its authorized operators and partners.",
+    "who is behind your creation": "NEXA AI is being developed under the leadership of Chandana Silva, with Yasaru Rathnasooriya leading the AI Engineering Team at PowerX Technologies. Together with a team of engineers, curriculum specialists, and stakeholders from the National Department of Education, they are building a next-generation AI-powered educational platform designed to transform teaching and learning across Papua New Guinea.",
+    "where were you created": "NEXA AI was developed within the PowerX AI Lab for educational use in PNG.",
+    "why were you created": "I was created to improve access to quality education and support teaching and learning across Papua New Guinea. My primary mission is to assist students, teachers, and schools, particularly in remote and underserved communities where access to educational resources, qualified teachers, and learning support may be limited. By providing AI-powered learning assistance, I aim to help ensure that every child has the opportunity to learn, grow, and achieve their full potential.",
+    "what is your mission": "To make learning more accessible, engaging, and effective for everyone.",
+    "are you a png ai": "Yes. NEXA AI is designed specifically to support the educational needs of Papua New Guinea.",
+    "what makes you different from other ai systems": "NEXA AI is tailored to PNG education, curriculum, and local needs.",
+    "what languages can you speak": "I can communicate in English and support other languages as configured.",
+    "can you understand tok pisin": "Yes, I can assist in Tok Pisin where supported.",
+    "can you understand local png languages": "Support may be added as language resources become available.",
+    "can you learn new information": "I can be updated with approved knowledge and educational content.",
+    "how often are you updated": "Updates are released periodically by administrators.",
+    "what information do you know": "I provide information based on my approved knowledge sources.",
+    "do you know the png curriculum": "Yes, I am designed to support PNG curriculum-aligned learning.",
+    "can you help with stem subjects": "Yes, I can assist with science, technology, engineering, and mathematics.",
+    "can you support vocational education": "Yes, I can support vocational and technical learning.",
+    "can you help with research": "Yes, I can help students and teachers explore topics and resources.",
+    "can you explain difficult concepts": "Yes, I can simplify and explain complex topics.",
+    "are you dangerous to humans": "No. I am designed to assist people safely and responsibly.",
+}
+
+
+def normalize_faq_query(message: str) -> str:
+    return re.sub(r"[^a-z0-9 ]+", "", (message or "").strip().lower())
+
+
+def build_nexa_faq_answer(message: str) -> str:
+    normalized = normalize_faq_query(message)
+    if not normalized:
+        return ""
+
+    for question, answer in NEXA_FAQ_ANSWERS.items():
+        if normalized == question:
+            return answer
+        if normalized.startswith(question):
+            return answer
+        if question in normalized:
+            return answer
+        if normalized in question:
+            return answer
+
+    return ""
+
+
 def record_chat_turn(session_id: str, role: str, content: str) -> None:
     if session_id not in SESSION_CHAT_HISTORY:
         SESSION_CHAT_HISTORY[session_id] = []
@@ -1388,18 +1435,21 @@ async def chat_endpoint(request: ChatRequest):
     try:
         config = {"configurable": {"session_id": session_id}}
 
-        web_answer = build_general_knowledge_answer(request.message)
-        if web_answer:
-            answer = web_answer
-        elif conversational_rag_chain is None:
-            answer = "Chat is available, but the curriculum model dependencies are not installed in this workspace."
+        faq_answer = build_nexa_faq_answer(request.message)
+        if faq_answer:
+            answer = faq_answer
         else:
-            result = conversational_rag_chain.invoke(
-                {"input": request.message, "audience": build_role_instruction(access_role)},
-                config=config
-            )
-
-            answer = result.get("answer") or "No response"
+            web_answer = build_general_knowledge_answer(request.message)
+            if web_answer:
+                answer = web_answer
+            elif conversational_rag_chain is None:
+                answer = "Chat is available, but the curriculum model dependencies are not installed in this workspace."
+            else:
+                result = conversational_rag_chain.invoke(
+                    {"input": request.message, "audience": build_role_instruction(access_role)},
+                    config=config
+                )
+                answer = result.get("answer") or "No response"
 
         pdf_url = None
         image_url = None
